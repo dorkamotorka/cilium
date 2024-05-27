@@ -40,15 +40,17 @@ docker run --privileged --name lb-node -d --restart=on-failure:10 \
 docker run --name nginx -d --network cilium-l4lb nginx
 
 # Create additional veth pair which is going to be used to test XDP_REDIRECT.
-ip l a l4lb-veth0 type veth peer l4lb-veth1
+# The veth pair is created in the host netns and one end is moved to the lb-node (l4lb-veth1).
+# The other stays at in the host netns (l4lb-veth0).
+ip link add l4lb-veth0 type veth peer l4lb-veth1
 SECOND_LB_NODE_IP=3.3.3.2
-ip a a "3.3.3.1/24" dev l4lb-veth0
+ip addr add "3.3.3.1/24" dev l4lb-veth0
 CONTROL_PLANE_PID=$(docker inspect lb-node -f '{{ .State.Pid }}')
-ip l s dev l4lb-veth1 netns $CONTROL_PLANE_PID
-ip l s dev l4lb-veth0 up
+ip link set dev l4lb-veth1 netns $CONTROL_PLANE_PID
+ip link set dev l4lb-veth0 up
 nsenter -t $CONTROL_PLANE_PID -n /bin/sh -c "\
-    ip a a "${SECOND_LB_NODE_IP}/24" dev l4lb-veth1 && \
-    ip l s dev l4lb-veth1 up"
+    ip addr add "${SECOND_LB_NODE_IP}/24" dev l4lb-veth1 && \
+    ip link set dev l4lb-veth1 up"
 
 # Wait until Docker is ready in the lb-node node
 while ! docker exec -t lb-node docker ps >/dev/null; do sleep 1; done
@@ -73,11 +75,16 @@ docker exec -t lb-node \
     --devices="eth0,l4lb-veth1" \
     --direct-routing-device=eth0
 
+# Get the interface index of the eth0 interface in the lb-node container
+# This is the default veth pair between the ran container and the host
 IFIDX=$(docker exec -i lb-node \
-    /bin/sh -c 'echo $(( $(ip -o l show eth0 | awk "{print $1}" | cut -d: -f1) ))')
+    /bin/sh -c 'echo $(( $(ip -o link show eth0 | awk "{print $1}" | cut -d: -f1) ))')
+# Now using the interface index, get the interface name in the host netns
 LB_VETH_HOST=$(ip -o l | grep "if$IFIDX" | awk '{print $2}' | cut -d@ -f1)
-ip l set dev $LB_VETH_HOST xdp obj bpf_xdp_veth_host.o
-ip l set dev l4lb-veth0 xdp obj bpf_xdp_veth_host.o
+# Attaching the dummy xdp program (just XDP_PASS)
+# Just pass the packets on the default veth interfaces
+ip link set dev $LB_VETH_HOST xdp obj bpf_xdp_veth_host.o
+ip link set dev l4lb-veth0 xdp obj bpf_xdp_veth_host.o
 
 # Disable TX and RX csum offloading, as veth does not support it. Otherwise,
 # the forwarded packets by the LB to the worker node will have invalid csums.
@@ -85,14 +92,14 @@ ethtool -K $LB_VETH_HOST rx off tx off
 ethtool -K l4lb-veth0 rx off tx off
 
 NGINX_PID=$(docker inspect nginx -f '{{ .State.Pid }}')
-WORKER_IP=$(nsenter -t $NGINX_PID -n ip -o -4 a s eth0 | awk '{print $4}' | cut -d/ -f1)
-WORKER_MAC=$(nsenter -t $NGINX_PID -n ip -o l show dev eth0 | grep -oP '(?<=link/ether )[^ ]+')
+WORKER_IP=$(nsenter -t $NGINX_PID -n ip -o -4 addr show eth0 | awk '{print $4}' | cut -d/ -f1)
+WORKER_MAC=$(nsenter -t $NGINX_PID -n ip -o link show dev eth0 | grep -oP '(?<=link/ether )[^ ]+')
 
 # Install BPF program to terminate encapsulated packets coming from the LB
 nsenter -t $NGINX_PID -n /bin/sh -c \
     'tc qdisc add dev eth0 clsact && tc filter add dev eth0 ingress bpf direct-action object-file ./test_tc_tunnel.o section decap'
 
-# Wait until Cilium is ready
+# Wait until Cilium is ready (socket is unavailable until it is ready)
 while ! docker exec -t lb-node docker exec -t cilium-lb cilium-dbg status; do sleep 1; done
 
 ##########
@@ -101,14 +108,15 @@ while ! docker exec -t lb-node docker exec -t cilium-lb cilium-dbg status; do sl
 
 LB_VIP="10.0.0.2"
 
-nsenter -t $(docker inspect nginx -f '{{ .State.Pid }}') -n /bin/sh -c \
-    "ip a a dev eth0 ${LB_VIP}/32"
+# Go inside the nginx container network namespace and add the VIP to the eth0 interface
+nsenter -t $NGINX_PID -n /bin/sh -c \
+    "ip addr add dev eth0 ${LB_VIP}/32"
 
 docker exec -t lb-node docker exec -t cilium-lb \
     cilium-dbg service update --id 1 --frontend "${LB_VIP}:80" --backends "${WORKER_IP}:80" --k8s-load-balancer
 
 LB_NODE_IP=$(docker exec lb-node ip -o -4 a s eth0 | awk '{print $4}' | cut -d/ -f1)
-ip r a "${LB_VIP}/32" via "$LB_NODE_IP"
+ip route add "${LB_VIP}/32" via "$LB_NODE_IP"
 
 # Issue 10 requests to LB
 for i in $(seq 1 10); do
@@ -117,7 +125,7 @@ done
 
 # Now steer the traffic to LB_VIP via the secondary device so that XDP_REDIRECT
 # can be tested on the L4LB node
-ip r replace "${LB_VIP}/32" via "$SECOND_LB_NODE_IP"
+ip route replace "${LB_VIP}/32" via "$SECOND_LB_NODE_IP"
 
 # Issue 10 requests to LB
 for i in $(seq 1 10); do
@@ -130,7 +138,8 @@ docker exec -t lb-node docker exec -t cilium-lb \
 
 # Do not stop on error
 set +e
-# Issue 10 requests to LB, we expect all to fail due to a Failed connection
+# Issue 10 requests to LB, we expect all to fail due to a Failed connection 
+# (because the --backend-weight is set to 0 a.k.a. don't send traffic to this backend)
 for i in $(seq 1 10); do
     curl -o /dev/null -m 0.5 "${LB_VIP}:80"
     # code 7 - Failed to connect ... : No route to host
